@@ -1,8 +1,10 @@
 import os
+import argparse
 
 import torch
 import trimesh
 import numpy as np
+import cumcubes
 from tqdm import tqdm
 from scipy.spatial import cKDTree
 
@@ -18,8 +20,10 @@ class Fitter:
         self, 
         data : torch.Tensor, 
         expname : str = "test",
+        checkpoints_path: str = "ckpt"
     ):
         self.expname = expname
+        self.checkpoints_path = checkpoints_path
         
         self.data = data
         self.input_min = torch.min(self.data[..., :3], dim=0)[0].squeeze().cpu().numpy()
@@ -33,7 +37,7 @@ class Fitter:
             level=10,
             geometric_init=True,
             inside_outside=False,
-            bias=max(0.5, max(self.input_max - self.input_min)) 
+            bias=max(0.5, max(self.input_max - self.input_min)/2)
         ).cuda()
 
         ptree = cKDTree(self.data)
@@ -71,7 +75,8 @@ class Fitter:
         self.global_step = 0
 
     def run(self):
-        for epoch in range(self.startepoch, self.nepoch+1):
+        pbar = tqdm(range(self.startepoch, self.nepoch+1), total=self.nepoch-self.startepoch)
+        for epoch in pbar:
             if epoch % 1000 == 0:
                 self.export_mesh(
                     filename=os.path.join("outmesh", self.expname, f"{epoch}.ply"),
@@ -95,13 +100,15 @@ class Fitter:
             nonmnfld_pred, nonmndlf_grad = self.sdf_net(nonmndlf_pnts)
 
             mnfld_loss = (mnfld_pred.abs()).mean()
-            if epoch < 2000:
-                grad_loss = 0.1 * ((nonmndlf_grad.norm(2, dim=-1) - 1) ** 2).mean()
-            else:
-                eikonal_points = torch.empty_like(mnfld_pnts[:2000, ...].detach()).uniform_(-self.ek_bound, self.ek_bound)
-                _, normal_eik = self.sdf_net(eikonal_points)
-                normal_eik = torch.cat([normal_eik, nonmndlf_grad], dim=-2)
-                grad_loss = 0.05 * ((normal_eik.norm(2, dim=-1) - 1) ** 2).mean()
+            grad_loss = 0.
+            if epoch > 1000:
+                if epoch < 4000:
+                    grad_loss = 0.1 * ((nonmndlf_grad.norm(2, dim=-1) - 1) ** 2).mean()
+                else:
+                    eikonal_points = torch.empty_like(mnfld_pnts[:2000, ...].detach()).uniform_(-self.ek_bound, self.ek_bound)
+                    _, normal_eik = self.sdf_net(eikonal_points)
+                    normal_eik = torch.cat([normal_eik, nonmndlf_grad], dim=-2)
+                    grad_loss = 0.05 * ((normal_eik.norm(2, dim=-1) - 1) ** 2).mean()
             normals_loss = ((mnfld_grad - normals).abs()).norm(2, dim=1).mean()
             loss = mnfld_loss + normals_loss + grad_loss
 
@@ -110,8 +117,14 @@ class Fitter:
             self.optimizer.step()
             
             if epoch % 100 == 0 :
-                print(f"epoch {epoch}/{self.nepoch} | loss {loss} | sdf {mnfld_loss} | norm {normals_loss} | ek {grad_loss}")
+                pbar.set_description(
+                    f"epoch {epoch} / {self.nepoch} | loss {loss:.04f} "
+                    f"| sdf {mnfld_loss:.04f} | norm {normals_loss:.04f} "
+                    f"| ek {grad_loss:.04f}"
+                )
 
+            if epoch % 5000 == 0:
+                self.save_checkpoints(epoch)
 
     def save_checkpoints(self, epoch):
         torch.save(
@@ -163,23 +176,21 @@ class Fitter:
         thresh: float=0,
         device: str="cuda:0"
     ) -> None:
-        bound = max(self.input_max - self.input_min)
+        bound = 1.0
         centers_shape = (resolution, resolution, resolution)
-        half_grid_size = bound / resolution + 0.1
+        half_grid_size = bound / resolution
 
         X = torch.linspace(
-            self.input_min[0] - half_grid_size, self.input_max[0] + half_grid_size, resolution
+           -bound + half_grid_size, bound + half_grid_size, resolution
         ).to(device)
         Y = torch.linspace(
-            self.input_min[1] - half_grid_size, self.input_max[1] + half_grid_size, resolution
+           -bound + half_grid_size, bound + half_grid_size, resolution
         ).to(device)
         Z = torch.linspace(
-            self.input_min[2] - half_grid_size, self.input_max[2] + half_grid_size, resolution
+           -bound + half_grid_size, bound + half_grid_size, resolution
         ).to(device)
         X, Y, Z = torch.meshgrid(X, Y, Z, indexing="ij")
         mc_grid = torch.stack((X, Y, Z), dim=-1).view(-1, 3)  # [N, 3]
-
-        import cumcubes
 
         out_dir = os.path.dirname(filename)
         os.makedirs(out_dir, exist_ok=True)
@@ -187,19 +198,43 @@ class Fitter:
         for i in range(0, len(mc_grid), batch_size):
             sdf[i : i + batch_size] = self.sdf_net.sdf(mc_grid[i : i + batch_size])[..., 0]
         sdf = sdf.reshape(centers_shape).contiguous()
+
         vertices, faces = cumcubes.marching_cubes(
             sdf, thresh, ([-bound] * 3, [bound] * 3), verbose=False
         )
         cumcubes.save_mesh(vertices, faces, filename=filename)
-
         torch.cuda.empty_cache()
+
+        # To remove the useless part of the reconstruction
+        meshexport = trimesh.load(filename)
+        connected_comp = meshexport.split(only_watertight=False)
+        max_area = 0
+        max_comp = None
+        for comp in connected_comp:
+            if comp.area > max_area:
+                max_area = comp.area
+                max_comp = comp
+        meshexport = max_comp
+        meshexport.export(filename)
 
 
 
 if __name__=='__main__':
-    inmesh = "data/test1_rot.obj"
 
-    meshpts_file = f"{inmesh}".replace(".obj", ".xyz")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--in_mesh", type=str, default="data/test1_rot.obj", help="mesh to fit")
+    parser.add_argument("--expname", type=str, default="test1", help="name for this experiment")
+    parser.add_argument("--ckpt", type=str, default="ckpt", help="path to checkpoint")
+    parser.add_argument("--load_ckpt", type=str, default=None, help="path to checkpoint")
+    args = parser.parse_args()
+
+    inmesh = args.in_mesh
+    expname = str(args.expname)
+    ckpt_path = str(args.ckpt)
+    load_ckpt = str(args.load_ckpt)
+    os.makedirs(os.path.join(ckpt_path, expname), exist_ok=True)
+
+    meshpts_file = f"{inmesh[:-4]}.xyz"
     if os.path.exists(meshpts_file):
         data = np.loadtxt(meshpts_file)
     else:
@@ -209,7 +244,12 @@ if __name__=='__main__':
         np.savetxt(meshpts_file, data, fmt='%.6f')
     data = torch.tensor(torch.from_numpy(data)).float()
 
-
-    fitter = Fitter(data, expname="test1")
+    # Fitting
+    fitter = Fitter(data, 
+                    expname=expname,
+                    checkpoints_path=ckpt_path)
     fitter.run()
-    
+
+    # Evaluation
+    # TODO: evaluation from loaded ckpt
+    # assert os.path.exists(load_ckpt)
