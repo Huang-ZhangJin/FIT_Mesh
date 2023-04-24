@@ -20,7 +20,8 @@ class Fitter:
         self, 
         data : torch.Tensor, 
         expname : str = "test",
-        checkpoints_path: str = "ckpt"
+        checkpoints_path: str = "ckpt",
+        mc_resolution: int = 256
     ):
         self.expname = expname
         self.checkpoints_path = checkpoints_path
@@ -71,8 +72,9 @@ class Fitter:
         self.ek_bound = 1.5
         self.startepoch = 0
         self.points_batch = 16384
-        self.nepoch = 100000
+        self.nepoch = 20000
         self.global_step = 0
+        self.mc_resolution = mc_resolution
 
     def run(self):
         pbar = tqdm(range(self.startepoch, self.nepoch+1), total=self.nepoch-self.startepoch)
@@ -80,7 +82,7 @@ class Fitter:
             if epoch % 1000 == 0:
                 self.export_mesh(
                     filename=os.path.join("outmesh", self.expname, f"{epoch}.ply"),
-                    resolution = 128
+                    resolution = self.mc_resolution
                 )
 
             indices = torch.tensor(np.random.choice(self.data.shape[0], self.points_batch, False))
@@ -239,7 +241,7 @@ if __name__=='__main__':
         data = np.loadtxt(meshpts_file)
     else:
         mesh = trimesh.load(inmesh)
-        datapts, datanormal = sampleGT(mesh, samplepointsnum=1000000)
+        datapts, datanormal = sampleGT(mesh, samplepointsnum=5000000)
         data = np.concatenate((datapts, datanormal), axis=1)
         np.savetxt(meshpts_file, data, fmt='%.6f')
     data = torch.tensor(torch.from_numpy(data)).float()
